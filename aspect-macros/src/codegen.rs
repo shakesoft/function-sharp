@@ -39,15 +39,33 @@ fn has_receiver(func: &ItemFn) -> bool {
         .any(|arg| matches!(arg, syn::FnArg::Receiver(_)))
 }
 
+/// Converts a parameter pattern into a valid call-argument expression.
+///
+/// A binding pattern such as `mut item` or `ref item` is legal in a function signature but is
+/// NOT a valid expression, so it cannot be passed through verbatim as a call argument. For a
+/// simple identifier binding we emit just the identifier (dropping `mut`/`ref`). Other patterns
+/// (e.g. tuple-struct destructuring like `Query(params)`) already parse as valid expressions and
+/// are forwarded unchanged.
+fn pat_to_call_arg(pat: &syn::Pat) -> TokenStream {
+    match pat {
+        Pat::Ident(pat_ident) if pat_ident.subpat.is_none() => {
+            let ident = &pat_ident.ident;
+            quote! { #ident }
+        }
+        other => quote! { #other },
+    }
+}
+
 fn generate_original_call(
     original_fn_name: &syn::Ident,
     param_names: &[&Box<syn::Pat>],
     has_receiver: bool,
 ) -> TokenStream {
+    let call_args: Vec<TokenStream> = param_names.iter().map(|pat| pat_to_call_arg(pat)).collect();
     if has_receiver {
-        quote! { Self::#original_fn_name(self #(, #param_names)*) }
+        quote! { Self::#original_fn_name(self #(, #call_args)*) }
     } else {
-        quote! { #original_fn_name(#(#param_names),*) }
+        quote! { #original_fn_name(#(#call_args),*) }
     }
 }
 
@@ -119,11 +137,24 @@ pub fn generate_aspect_wrapper(aspect_info: &AspectInfo, func: &ItemFn) -> Token
         )
     };
 
-    quote! {
-        #original_fn_renamed
+    if has_receiver {
+        quote! {
+            #original_fn_renamed
 
-        #fn_vis #fn_asyncness fn #fn_name #fn_generics(#fn_inputs) #fn_output #fn_where_clause {
-            #aspect_call
+            #fn_vis #fn_asyncness fn #fn_name #fn_generics(#fn_inputs) #fn_output #fn_where_clause {
+                #aspect_call
+            }
+        }
+    } else {
+        // For associated functions (no self) and free functions, embed the original as a local
+        // function inside the wrapper body. This makes the bare-name call resolve correctly in
+        // both free-function context and impl-block context (where Self:: would be required
+        // otherwise).
+        quote! {
+            #fn_vis #fn_asyncness fn #fn_name #fn_generics(#fn_inputs) #fn_output #fn_where_clause {
+                #original_fn_renamed
+                #aspect_call
+            }
         }
     }
 }
@@ -432,11 +463,24 @@ pub fn generate_async_aspect_wrapper(aspect_info: &AspectInfo, func: &ItemFn) ->
         has_receiver,
     );
 
-    quote! {
-        #original_fn_renamed
+    if has_receiver {
+        quote! {
+            #original_fn_renamed
 
-        #fn_vis async fn #fn_name #fn_generics(#fn_inputs) #fn_output #fn_where_clause {
-            #aspect_call
+            #fn_vis async fn #fn_name #fn_generics(#fn_inputs) #fn_output #fn_where_clause {
+                #aspect_call
+            }
+        }
+    } else {
+        // For associated functions (no self) and free functions, embed the original as a local
+        // function inside the wrapper body. This makes the bare-name call resolve correctly in
+        // both free-function context and impl-block context (where Self:: would be required
+        // otherwise).
+        quote! {
+            #fn_vis async fn #fn_name #fn_generics(#fn_inputs) #fn_output #fn_where_clause {
+                #original_fn_renamed
+                #aspect_call
+            }
         }
     }
 }
@@ -796,5 +840,63 @@ mod tests {
         let tokens = generate_aspect_wrapper(&aspect_info, &func).to_string();
 
         assert!(tokens.contains("Self :: __aspect_original_query (self , id)"));
+    }
+
+    #[test]
+    fn test_generate_async_aspect_wrapper_no_receiver_embeds_original_inline() {
+        // Associated functions without self (e.g. static methods in an impl block) must use a
+        // bare-name call. We achieve this by embedding the original function as a local function
+        // inside the wrapper body so the bare name resolves in any context.
+        let func: ItemFn = parse_quote! {
+            pub async fn process(x: u64) -> u64 { x + 1 }
+        };
+        let aspect_info = AspectInfo::parse(parse_quote!(Logger)).unwrap();
+        let tokens = generate_async_aspect_wrapper(&aspect_info, &func).to_string();
+
+        // Must NOT use Self:: — that would break free functions
+        assert!(!tokens.contains("Self :: __async_aspect_original_process"));
+        // Must call via bare name (works for both free fn and associated fn contexts)
+        assert!(tokens.contains("__async_aspect_original_process (x) . await"));
+    }
+
+    #[test]
+    fn test_generate_aspect_wrapper_no_receiver_embeds_original_inline() {
+        let func: ItemFn = parse_quote! {
+            pub fn compute(x: u64) -> u64 { x + 1 }
+        };
+        let aspect_info = AspectInfo::parse(parse_quote!(Logger)).unwrap();
+        let tokens = generate_aspect_wrapper(&aspect_info, &func).to_string();
+
+        assert!(!tokens.contains("Self :: __aspect_original_compute"));
+        assert!(tokens.contains("__aspect_original_compute (x)"));
+    }
+
+    #[test]
+    fn test_async_aspect_wrapper_strips_mut_binding_in_call() {
+        // A `mut item` parameter is a valid binding pattern but not a valid expression, so the
+        // generated call must pass the bare identifier `item`, not `mut item`.
+        let func: ItemFn = parse_quote! {
+            pub async fn update(rb: &str, mut item: u64) -> u64 { item }
+        };
+        let aspect_info = AspectInfo::parse(parse_quote!(Logger)).unwrap();
+        let tokens = generate_async_aspect_wrapper(&aspect_info, &func).to_string();
+
+        // The call site must use `item`, never `mut item`.
+        assert!(tokens.contains("__async_aspect_original_update (rb , item) . await"));
+        assert!(!tokens.contains("(rb , mut item)"));
+    }
+
+    #[test]
+    fn test_aspect_wrapper_strips_mut_binding_in_call_with_receiver() {
+        let func: ItemFn = parse_quote! {
+            fn update(&self, mut item: u64) -> u64 { item }
+        };
+        let aspect_info = AspectInfo::parse(parse_quote!(Logger)).unwrap();
+        let tokens = generate_aspect_wrapper(&aspect_info, &func).to_string();
+
+        assert!(tokens.contains("Self :: __aspect_original_update (self , item)"));
+        // The call site must not contain `mut`; note the renamed original fn declaration still
+        // legitimately keeps `& self , mut item : u64`, so we match the call form specifically.
+        assert!(!tokens.contains("Self :: __aspect_original_update (self , mut item)"));
     }
 }

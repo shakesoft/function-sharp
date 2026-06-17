@@ -9,6 +9,7 @@ use std::future::Future;
 use std::net::SocketAddr;
 use thiserror::Error;
 use tokio::time::Instant;
+use aspect_std::LoggingAspect;
 
 #[derive(Debug, Deserialize, Clone)]
 struct HelloRequest {
@@ -83,6 +84,10 @@ async fn main() {
     let listener = tokio::net::TcpListener::bind(addr)
         .await
         .expect("failed to bind tcp listener");
+
+    let dd = crate::ReqData{ name:"aaaa".to_string()};
+    let a = ApiService;
+    let b = a.run(dd).await;
 
     println!("axum_site listening on http://{}", addr);
     axum::serve(listener, app)
@@ -239,4 +244,21 @@ pub fn ok_result_data<T>(data: T) -> AppResult<Json<BaseResponse<T>>> {
         code: 0,
         data: Some(data),
     }))
+}
+
+#[derive(Serialize, Debug, Clone)]
+pub struct ReqData{
+    name:String
+}
+
+pub struct ApiService;
+
+impl ApiService {
+
+    // #[aspect(Logger2)]
+    #[aspect(LoggingAspect::new())]
+    pub async fn run(&self,data: ReqData) -> AppResult<()> {
+        ok_result_data("API Service is running").map(|_| ())
+    }
+
 }
